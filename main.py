@@ -208,7 +208,7 @@ def build_prompt(req: MonthlySummaryRequest) -> str:
 
 ###### 헬스체크 (서버가 살아있는지 확인 가능) ######
 ## http://localhost:8000/health로 서버 실행 중인지 확인 가능 ##
-@app.get("/health")
+@app.get("/ai/health")
 def health():
     return {"ok": True}
 
@@ -216,7 +216,7 @@ def health():
 
 
 ###### 월별 요약 API ######
-@app.post("/summaries/monthly", response_model=MonthlySummaryResponse)
+@app.post("/ai/summaries/monthly", response_model=MonthlySummaryResponse)
 def summarize_monthly(req: MonthlySummaryRequest):
     try:
         prompt = build_prompt(req)
