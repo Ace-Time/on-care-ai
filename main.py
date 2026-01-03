@@ -1,9 +1,9 @@
 import uvicorn
 import os, sys, io
 from typing import List, Optional, Dict, Any
-from dotenv import load_dotenv  #오픈API키 가져오는 함수
+from dotenv import load_dotenv
 
-from fastapi import FastAPI     #파이썬 웹 프레임워크(백엔드에서 호출 가능하게 해줌)
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -11,28 +11,29 @@ from fastapi import HTTPException
 
 from openai import OpenAI
 
-
-
 ###### 환경설정 / 인코딩 ######
-load_dotenv()                   #오픈API키 가져오는 함수
+load_dotenv()
 
-# 콘솔 UTF-8 강제 (Windows에서 한글 깨짐 방지)
+# 콘솔 UTF-8 강제
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8")
 
-client = OpenAI()  # OPENAI_API_KEY를 .env에서 자동 사용
+# [수정 부분] 서버 시작 시 즉시 생성하지 않고 None으로 초기화합니다.
+client = None
 
-app = FastAPI(title="OnCare AI Summary API", version="1.0.0")       #Fast API로 서버로 바꿈. 백엔드에서 호출가능하게 하려고
+def get_client():
+    global client
+    if client is not None:
+        return client
+    
+    api_key = os.getenv("OPENAI_API_KEY")
+    if api_key:
+        client = OpenAI(api_key=api_key)
+        return client
+    
+    return None
 
-# (선택) CORS - 보통 AI 서버는 백엔드만 호출하니까 굳이 프론트 오픈 안 해도 됨(프론트에서 직접 Fast API호출시만 필요)
-# app.add_middleware(
-#     CORSMiddleware,
-#     allow_origins=["*"],  # 개발용. 운영에서는 백엔드 주소만 허용 권장
-#     allow_credentials=True,
-#     allow_methods=["*"],
-#     allow_headers=["*"],
-# )
-
+app = FastAPI(title="OnCare AI Summary API", version="1.0.0")
 
 ###### 요청/응답 모델 ######
 class DailyLogForSummary(BaseModel):
@@ -55,13 +56,10 @@ class MonthlySummaryRequest(BaseModel):
 class MonthlySummaryResponse(BaseModel):
     beneficiaryId: int
     month: str
-    summaryText: str    #월별 AI요약 내용
+    summaryText: str
     meta: Dict[str, Any] = Field(default_factory=dict)
 
-
-
 ###### 유틸: 프롬프트 구성 ######
-# 로그가 너무 길어질 수 있으니, note는 120자 정도로 자르는 것을 권장
 def build_prompt(req: MonthlySummaryRequest) -> str:
     lines = []
     for log in req.logs:
@@ -84,8 +82,6 @@ def build_prompt(req: MonthlySummaryRequest) -> str:
 
     logs_block = "\n".join(lines) if lines else "(해당 월 로그 없음)"
 
-    # 비용/토큰 낭비되면 프롬프트 예시부분에 1개만 두기
-    # 결과를 “월별 카드에 들어갈 문장”으로 만들기: 너무 길지 않게(1~2줄 정도)
     prompt = f"""
 너는 장기요양 요양일지를 월별로 요약해주는 도우미야.
 대상 독자는 관리자이며, 관리자는 이 요약을 통해 특정 수급자의 해당 월 건강상태 경향을 빠르게 파악해야 해.
@@ -204,16 +200,10 @@ def build_prompt(req: MonthlySummaryRequest) -> str:
 
     return prompt
 
-
-
-###### 헬스체크 (서버가 살아있는지 확인 가능) ######
-## http://localhost:8000/health로 서버 실행 중인지 확인 가능 ##
+###### 헬스체크 ######
 @app.get("/ai/health")
 def health():
     return {"ok": True}
-
-
-
 
 ###### 월별 요약 API ######
 @app.post("/ai/summaries/monthly", response_model=MonthlySummaryResponse)
@@ -221,10 +211,15 @@ def summarize_monthly(req: MonthlySummaryRequest):
     try:
         prompt = build_prompt(req)
 
-        result = client.responses.create(
+        # [수정 부분] 전역 변수가 아닌 함수 내부에서 클라이언트를 가져옵니다.
+        ai_client = get_client()
+        if ai_client is None:
+            raise HTTPException(status_code=500, detail="OpenAI API Key가 설정되지 않았습니다.")
+
+        result = ai_client.responses.create(
             model="gpt-4o-mini",
             input=[{"role": "user", "content": prompt}],
-            max_output_tokens=350,      #요약은 너무 길 필요가 없으니까 제한
+            max_output_tokens=350,
         )
 
         text = (result.output_text or "").strip()
@@ -232,13 +227,11 @@ def summarize_monthly(req: MonthlySummaryRequest):
         if not text:
             raise HTTPException(status_code=502, detail="AI 요약 결과가 비어있습니다.")
         
-        # usage에서 토큰 추출 (SDK 버전 차이를 대비해 안전하게)
         usage = getattr(result, "usage", None) or {}
         input_tokens = getattr(usage, "input_tokens", None)
         output_tokens = getattr(usage, "output_tokens", None)
         total_tokens = getattr(usage, "total_tokens", None)
 
-        # usage가 dict로 오는 경우 대비
         if isinstance(usage, dict):
             input_tokens = usage.get("input_tokens", input_tokens)
             output_tokens = usage.get("output_tokens", output_tokens)
@@ -249,7 +242,6 @@ def summarize_monthly(req: MonthlySummaryRequest):
             month=req.month,
             summaryText=text,
             meta={"logsCount": len(req.logs), "model": "gpt-4o-mini",
-                # 토큰 정보 추가
                 "inputTokens": int(input_tokens or 0),
                 "outputTokens": int(output_tokens or 0),
                 "totalTokens": int(total_tokens or 0),},
@@ -257,11 +249,6 @@ def summarize_monthly(req: MonthlySummaryRequest):
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"AI 요약 생성 실패: {str(e)}")
 
-
-# ---  FastAPI 서버 구동 ---
+# --- FastAPI 서버 구동 ---
 if __name__ == "__main__":
-    # '0.0.0.0' = localhost, 127.0.0.1 및 외부 IP로 모두 접속 허용
-    # port = 8000 (Java의 8080과 겹치지 않게 주의)
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
-    
-    ### (터미널창에 입력하면 실행됨) python -m uvicorn main:app --reload --port 8000 ###
